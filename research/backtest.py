@@ -101,49 +101,73 @@ def run(df: pd.DataFrame, cfg: dict, out: Path) -> None:
     horizons = [int(x) for x in cfg.get("horizons_days", [7, 14, 30])]
     hedges = ["static_1to1", "delta_50", "delta_entry"]
     rows: list[pd.DataFrame] = []
+    tolerance = pd.Timedelta(hours=12)
 
+    # Interpret 7/14/30D as entry DTE buckets, not holding periods.
+    # Each contract is entered at the observation closest to target DTE and exited
+    # at the final pre-expiry observation. This matches an option-expiry hedge study
+    # and avoids requiring a contract to survive 7/14/30 days after entry.
     for symbol, g in df.groupby("symbol", sort=False):
         g = g.sort_values("time").reset_index(drop=True)
         if len(g) < 2:
             continue
-        exits = g[["time", "price", "underlying"]].rename(columns={"time": "exit_time", "price": "exit_price", "underlying": "exit_underlying"})
+        expiry = g["expiry"].iloc[0]
+        g["dte"] = (expiry - g["time"]).dt.total_seconds() / 86400.0
+        exit_row = g.iloc[-1]
+        if exit_row["time"] >= expiry:
+            continue
         for horizon in horizons:
-            target = g[["time", "price", "underlying", "strike", "expiry", "call", "iv", "delta"]].copy()
-            target["exit_target"] = target["time"] + pd.Timedelta(days=horizon)
-            m = pd.merge_asof(target.sort_values("exit_target"), exits.sort_values("exit_time"), left_on="exit_target", right_on="exit_time", direction="nearest", tolerance=pd.Timedelta(minutes=30))
-            m = m.dropna(subset=["exit_price", "exit_underlying"])
-            m = m[m["exit_time"] < m["expiry"]]
-            if m.empty:
+            target = g.iloc[(g["dte"] - horizon).abs().argsort().iloc[0]]
+            if abs(float(target["dte"]) - horizon) > float(tolerance.total_seconds() / 86400):
                 continue
-            m["option_type"] = np.where(m["call"], "CALL", "PUT")
-            m["option_pnl"] = m["price"] - m["exit_price"]
-            m["spot_move"] = m["exit_underlying"] - m["underlying"]
+            if target["time"] >= exit_row["time"]:
+                continue
+            entry_price = float(target["price"])
+            exit_price = float(exit_row["price"])
+            entry_underlying = float(target["underlying"])
+            exit_underlying = float(exit_row["underlying"])
+            option_pnl = entry_price - exit_price
+            spot_move = exit_underlying - entry_underlying
+            option_type = "CALL" if bool(target["call"]) else "PUT"
             for mode in hedges:
                 if mode == "static_1to1":
-                    hedge = np.where(m["call"], 1.0, -1.0)
-                    valid = np.ones(len(m), dtype=bool)
+                    hedge = 1.0 if bool(target["call"]) else -1.0
                 elif mode == "delta_50":
-                    hedge = np.where(m["call"], 0.5, -0.5)
-                    valid = np.ones(len(m), dtype=bool)
+                    hedge = 0.5 if bool(target["call"]) else -0.5
                 else:
-                    hedge = pd.to_numeric(m["delta"], errors="coerce").to_numpy()
-                    valid = np.isfinite(hedge) & (np.abs(hedge) <= 1.5)
-                if not valid.any():
-                    continue
-                r = m.loc[valid, ["symbol", "time", "exit_time", "strike", "expiry", "option_type", "price", "exit_price", "underlying", "exit_underlying", "iv", "delta"]].copy()
-                h = np.asarray(hedge)[valid]
-                r["horizon_days"] = horizon
-                r["hedge"] = mode
-                r["hedge_qty"] = h
-                r["option_pnl"] = r["price"] - r["exit_price"]
-                r["futures_pnl"] = h * (r["exit_underlying"] - r["underlying"])
-                r["gross_pnl"] = r["option_pnl"] + r["futures_pnl"]
-                r["estimated_cost"] = (r["price"].abs() + np.abs(h) * r["underlying"].abs()) * cost_rate
-                r["net_pnl"] = r["gross_pnl"] - r["estimated_cost"]
-                rows.append(r)
+                    hedge = float(target["delta"]) if pd.notna(target["delta"]) else np.nan
+                    if not np.isfinite(hedge) or abs(hedge) > 1.5:
+                        continue
+                futures_pnl = hedge * spot_move
+                gross_pnl = option_pnl + futures_pnl
+                estimated_cost = (abs(entry_price) + abs(hedge) * abs(entry_underlying)) * cost_rate
+                net_pnl = gross_pnl - estimated_cost
+                rows.append(pd.DataFrame([{
+                    "symbol": symbol,
+                    "entry_time": target["time"],
+                    "exit_time": exit_row["time"],
+                    "entry_dte": float(target["dte"]),
+                    "horizon_days": horizon,
+                    "option_type": option_type,
+                    "hedge": mode,
+                    "hedge_qty": hedge,
+                    "strike": float(target["strike"]),
+                    "expiry": expiry,
+                    "iv": float(target["iv"]) if pd.notna(target["iv"]) else np.nan,
+                    "delta": float(target["delta"]) if pd.notna(target["delta"]) else np.nan,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "entry_underlying": entry_underlying,
+                    "exit_underlying": exit_underlying,
+                    "option_pnl": option_pnl,
+                    "futures_pnl": futures_pnl,
+                    "gross_pnl": gross_pnl,
+                    "estimated_cost": estimated_cost,
+                    "net_pnl": net_pnl,
+                }]))
 
     if not rows:
-        raise RuntimeError("No valid backtest observations after schema/expiry filtering")
+        raise RuntimeError("No valid backtest observations after DTE/expiry filtering")
     trades = pd.concat(rows, ignore_index=True)
     trades.to_csv(out / "trades.csv", index=False)
 
@@ -153,12 +177,22 @@ def run(df: pd.DataFrame, cfg: dict, out: Path) -> None:
         return float(gains / losses) if losses > 0 else float("inf")
 
     summary = trades.groupby(["horizon_days", "option_type", "hedge"], as_index=False).agg(
-        trades=("net_pnl", "size"), net_pnl=("net_pnl", "sum"), mean_pnl=("net_pnl", "mean"), median_pnl=("net_pnl", "median"),
-        win_rate=("net_pnl", lambda x: float((x > 0).mean())), pnl_std=("net_pnl", "std"))
+        trades=("net_pnl", "size"),
+        net_pnl=("net_pnl", "sum"),
+        mean_pnl=("net_pnl", "mean"),
+        median_pnl=("net_pnl", "median"),
+        win_rate=("net_pnl", lambda x: float((x > 0).mean())),
+        pnl_std=("net_pnl", "std"),
+    )
     summary["profit_factor"] = [profit_factor(trades.loc[(trades.horizon_days == r.horizon_days) & (trades.option_type == r.option_type) & (trades.hedge == r.hedge), "net_pnl"]) for r in summary.itertuples()]
     summary.to_csv(out / "strategy_comparison.csv", index=False)
     metadata = {
-        "rows_loaded": int(len(df)), "trade_rows": int(len(trades)), "hedges_tested": hedges, "horizons_days": horizons,
+        "rows_loaded": int(len(df)),
+        "trade_rows": int(len(trades)),
+        "hedges_tested": hedges,
+        "horizons_days": horizons,
+        "horizon_semantics": "entry DTE bucket; exit at final pre-expiry observation",
+        "entry_tolerance_hours": 12,
         "cost_model": "fee + spread + slippage placeholder; funding not modeled in baseline",
         "iv_rv_filter": "not implemented in baseline",
         "threshold_dynamic_hedging": "deferred until hourly hedge-path simulation is implemented",
