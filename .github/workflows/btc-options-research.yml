@@ -1,6 +1,8 @@
 name: BTC Options Research
 
 on:
+  push:
+    branches: [research/btc-options-backtest]
   workflow_dispatch:
     inputs:
       start_date:
@@ -11,6 +13,10 @@ on:
         description: End date
         required: true
         default: '2023-10-23'
+
+env:
+  START_DATE: '2023-05-18'
+  END_DATE: '2023-10-23'
 
 jobs:
   research:
@@ -23,7 +29,7 @@ jobs:
           python-version: '3.12'
       - run: pip install -r requirements-research.txt
       - name: Download Binance options
-        run: python research/download_options.py --start '${{ inputs.start_date }}' --end '${{ inputs.end_date }}' --combine
+        run: python research/download_options.py --start "$START_DATE" --end "$END_DATE" --combine
       - name: Validate dataset
         run: python research/validate_options.py data/processed/options.parquet
       - name: Run backtest
