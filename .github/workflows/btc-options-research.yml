@@ -1,0 +1,35 @@
+name: BTC Options Research
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: Start date
+        required: true
+        default: '2023-05-18'
+      end_date:
+        description: End date
+        required: true
+        default: '2023-10-23'
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-research.txt
+      - name: Download Binance options
+        run: python research/download_options.py --start '${{ inputs.start_date }}' --end '${{ inputs.end_date }}' --combine
+      - name: Validate dataset
+        run: python research/validate_options.py data/processed/options.parquet
+      - name: Run backtest
+        run: python research/backtest.py --input data/processed/options.parquet --config research/config.json --output results
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: btc-options-research-results
+          path: results/
