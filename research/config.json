@@ -1,0 +1,16 @@
+{
+  "start_date": "2023-05-18",
+  "end_date": "2023-10-23",
+  "symbol": "BTCUSDT",
+  "dataset": "EOHSummary",
+  "horizons_days": [7, 14, 30],
+  "option_types": ["CALL", "PUT"],
+  "iv_rv_premiums": [null, 0.05, 0.10, 0.20],
+  "hedges": ["static_1to1", "delta_50", "delta_dynamic", "delta_threshold_10"],
+  "costs": {
+    "fee_bps": 4.0,
+    "spread_bps": 2.0,
+    "slippage_bps": 1.0,
+    "funding_bps_per_8h": 0.0
+  }
+}
