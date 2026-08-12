@@ -11,9 +11,6 @@ on:
         description: End date
         required: true
         default: '2023-10-23'
-  push:
-    branches:
-      - research/btc-options-backtest
 
 jobs:
   research:
